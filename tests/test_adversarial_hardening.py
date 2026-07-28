@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import io
+import json
 import os
 import stat
 import subprocess
@@ -416,9 +417,9 @@ def test_real_fastmcp_registers_enabled_tools():
         [
             sys.executable,
             "-c",
-            "import cynthion_mcp.server as s; "
+            "import json; import cynthion_mcp.server as s; "
             "t=next(t for t in s.mcp._tool_manager.list_tools() if t.name=='capture_start'); "
-            "print(','.join(t.parameters['properties']['speed']['enum']))",
+            "print(json.dumps(t.parameters['properties']['speed']['enum']))",
         ],
         cwd=root,
         env=env,
@@ -427,7 +428,7 @@ def test_real_fastmcp_registers_enabled_tools():
         timeout=10,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "auto,high,full,low"
+    assert set(json.loads(result.stdout)) == {"auto", "high", "full", "low"}
 
 
 def test_invalid_speed_is_rejected_before_hardware(modules, monkeypatch):
