@@ -1,23 +1,16 @@
-"""Sniffer-mode (analyzer.bit) capture driver.
-
-Speaks the gateware's vendor protocol directly via libusb1:
-
-  - vendor request 1 (SET_STATE) on interface 0: enable/disable + speed select
-  - bulk IN endpoint 0x81: stream of captured packets (Cynthion native format)
-
-Raw capture bytes are written to a file under ``captures/`` for later decode.
-Packet decoding into USB transactions is intentionally NOT done here —
-Packetry is the reference decoder; for MCP use cases LLMs typically want raw
-bytes + summary stats, with deeper decode deferred to a follow-up tool.
-"""
-
+"""Sniffer-mode capture lifecycle with descriptor-relative private storage."""
 from __future__ import annotations
 
 import logging
 import os
+import re
+import stat
 import threading
 import time
 import uuid
+import fcntl
+from contextlib import contextmanager
+from itertools import islice
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
@@ -26,42 +19,37 @@ from typing import Any, Literal
 import usb.core
 import usb.util
 
-log = logging.getLogger(__name__)
+from .coordinator import HARDWARE_COORDINATOR
 
-ANALYZER_VID = 0x1D50
-ANALYZER_PID = 0x615B
-BULK_ENDPOINT_ADDR = 0x81
-VENDOR_IFACE = 0
+log = logging.getLogger(__name__)
+ANALYZER_VID, ANALYZER_PID = 0x1D50, 0x615B
+BULK_ENDPOINT_ADDR, VENDOR_IFACE = 0x81, 0
+CAPTURES_DIR = Path.home() / ".cynthion-mcp" / "captures"
+CAPTURE_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
+MAX_CAPTURE_BYTES = 64 * 1024 * 1024
+MAX_CAPTURE_SECONDS = 300
+MAX_RAW_READ_BYTES = 64 * 1024
+MAX_STORED_CAPTURES = 100
+MAX_STORED_BYTES = 512 * 1024 * 1024
+MAX_LIST_CAPTURES = 100
+MAX_DIRECTORY_SCAN = 1_000
+ID_RESERVATION_ATTEMPTS = 16
+STORAGE_LOCK_NAME = ".storage.lock"
+STARTUP_TIMEOUT_SECONDS = 5.0
+STOP_TIMEOUT_SECONDS = 5.0
 
 
 class VendorRequest(IntEnum):
     GET_STATE = 0
     SET_STATE = 1
-    GET_SPEEDS = 2
-    SET_TEST_CONFIG = 3
-    GET_MINOR_VERSION = 4
 
 
 class CaptureSpeed(IntEnum):
-    # State-register bits 1-2 encoding the analyzer speed.
-    # The mapping mirrors USBAnalyzerSpeed in cynthion.gateware.analyzer.speeds:
-    # HIGH = USBSpeed.HIGH(=0), FULL = USBSpeed.FULL(=1), LOW = USBSpeed.LOW(=2),
-    # AUTO = 0b11. The earlier comment in top.py (`0b00=HS, 0b01=FS, 0b11=LS`)
-    # is *out of date* — 0b10 is now LOW and 0b11 is AUTO on r0.6+.
-    HIGH = 0b00
-    FULL = 0b01
-    LOW = 0b10
-    AUTO = 0b11
+    HIGH, FULL, LOW, AUTO = 0, 1, 2, 3
 
 
-SPEED_NAMES = {
-    "auto": CaptureSpeed.AUTO,
-    "high": CaptureSpeed.HIGH,
-    "full": CaptureSpeed.FULL,
-    "low": CaptureSpeed.LOW,
-}
-
-CAPTURES_DIR = Path.home() / ".cynthion-mcp" / "captures"
+SPEED_NAMES = {"auto": CaptureSpeed.AUTO, "high": CaptureSpeed.HIGH,
+               "full": CaptureSpeed.FULL, "low": CaptureSpeed.LOW}
 
 
 @dataclass
@@ -70,174 +58,446 @@ class CaptureSession:
     speed: str
     started_at: float
     path: Path
+    _partial_name: str = field(repr=False)
+    _reservation_inode: int = field(repr=False)
+    _reservation_device: int = field(repr=False)
+    _started_monotonic: float = field(repr=False)
+    _reservation_fd: int | None = field(default=None, repr=False)
     _thread: threading.Thread | None = field(default=None, repr=False)
     _stop_flag: threading.Event = field(default_factory=threading.Event, repr=False)
-    _dev: Any = field(default=None, repr=False)  # pyusb Device handle owned by the drainer
+    _ready: threading.Event = field(default_factory=threading.Event, repr=False)
+    _dev: Any = field(default=None, repr=False)
     bytes_written: int = 0
     finished_at: float | None = None
     error: str | None = None
+    cleanup_confirmed: bool = False
+    _ownership_released: bool = field(default=False, repr=False)
+    _cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 _active: CaptureSession | None = None
-_lock = threading.Lock()
+_last_session: CaptureSession | None = None
+_lock = threading.RLock()
+_root_lock = threading.Lock()
+_capture_root_identity: tuple[int, int] | None = None
+
+
+def _safe_error(exc: Exception) -> str:
+    return type(exc).__name__
+
+
+def _ensure_capture_dir() -> None:
+    global _capture_root_identity
+    state_dir = CAPTURES_DIR.parent
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for directory in (state_dir, CAPTURES_DIR):
+        if directory == CAPTURES_DIR and not directory.exists():
+            directory.mkdir(mode=0o700)
+        info = directory.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError("capture storage is unsafe")
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(directory_fd)
+            if directory == CAPTURES_DIR:
+                identity = (opened.st_dev, opened.st_ino)
+                with _root_lock:
+                    if _capture_root_identity is None:
+                        _capture_root_identity = identity
+                    elif _capture_root_identity != identity:
+                        raise RuntimeError("capture storage identity changed")
+            os.fchmod(directory_fd, 0o700)
+        finally:
+            os.close(directory_fd)
+
+
+def _dirfd() -> int:
+    _ensure_capture_dir()
+    directory_fd = os.open(CAPTURES_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    opened = os.fstat(directory_fd)
+    if _capture_root_identity != (opened.st_dev, opened.st_ino):
+        os.close(directory_fd)
+        raise RuntimeError("capture storage identity changed")
+    return directory_fd
+
+
+def _validate_id(capture_id: str) -> str:
+    if not isinstance(capture_id, str) or not CAPTURE_ID_RE.fullmatch(capture_id):
+        raise ValueError("invalid capture id")
+    return capture_id
+
+
+def _capture_path(capture_id: str, suffix: str) -> Path:
+    _validate_id(capture_id)
+    _ensure_capture_dir()
+    return CAPTURES_DIR / f"{capture_id}{suffix}"
+
+
+def _entry_regular(directory_fd: int, name: str) -> os.stat_result:
+    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise FileNotFoundError("capture unavailable")
+    return info
+
+
+def open_capture_fd(capture_id: str, suffix: str = ".bin") -> tuple[int, os.stat_result]:
+    name = f"{_validate_id(capture_id)}{suffix}"
+    directory_fd = _dirfd()
+    try:
+        expected = _entry_regular(directory_fd, name)
+        fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+    except OSError as exc:
+        raise FileNotFoundError("capture unavailable") from exc
+    finally:
+        os.close(directory_fd)
+    try:
+        actual = os.fstat(fd)
+        if not stat.S_ISREG(actual.st_mode) or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            raise FileNotFoundError("capture changed while opening")
+        return fd, actual
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _stored_usage(directory_fd: int) -> tuple[int, int]:
+    count = total = 0
+    for entry in os.scandir(directory_fd):
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if entry.name == STORAGE_LOCK_NAME or not stat.S_ISREG(info.st_mode):
+            continue
+        count += 1
+        total += MAX_CAPTURE_BYTES if entry.name.endswith(".partial") else info.st_size
+    return count, total
+
+
+@contextmanager
+def storage_lock():
+    """Serialize storage accounting and publication across processes."""
+    directory_fd = _dirfd()
+    lock_fd = None
+    try:
+        lock_fd = os.open(
+            STORAGE_LOCK_NAME,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(lock_fd, 0o600)
+    finally:
+        os.close(directory_fd)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def require_storage_capacity(additional_entries: int, additional_bytes: int, replacing: tuple[str, ...] = ()) -> None:
+    directory_fd = _dirfd()
+    try:
+        count, total = _stored_usage(directory_fd)
+        for name in replacing:
+            try:
+                info = _entry_regular(directory_fd, name)
+            except OSError:
+                continue
+            count -= 1
+            total -= info.st_size
+        if count + additional_entries > MAX_STORED_CAPTURES or total + additional_bytes > MAX_STORED_BYTES:
+            raise RuntimeError("capture storage quota reached")
+    finally:
+        os.close(directory_fd)
+
+
+def _reserve_partial() -> tuple[str, str, int, os.stat_result]:
+    with storage_lock():
+        require_storage_capacity(1, MAX_CAPTURE_BYTES)
+        directory_fd = _dirfd()
+        try:
+            for _ in range(ID_RESERVATION_ATTEMPTS):
+                capture_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+                partial = f"{capture_id}.partial"
+                try:
+                    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=directory_fd)
+                except FileExistsError:
+                    continue
+                try:
+                    os.fchmod(fd, 0o600)
+                    return capture_id, partial, fd, os.fstat(fd)
+                except Exception:
+                    os.close(fd)
+                    os.unlink(partial, dir_fd=directory_fd)
+                    raise
+            raise RuntimeError("could not reserve unique capture id")
+        finally:
+            os.close(directory_fd)
+
+
+def _unlink_partial(name: str, device: int, inode: int) -> None:
+    directory_fd = _dirfd()
+    try:
+        try:
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != (device, inode):
+            raise RuntimeError("reserved capture changed")
+        os.unlink(name, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _close_reservation(session: CaptureSession) -> None:
+    if session._reservation_fd is not None:
+        try:
+            os.close(session._reservation_fd)
+        except OSError:
+            pass
+        session._reservation_fd = None
+
+
+def _release_session_ownership(session: CaptureSession) -> None:
+    global _active
+    with _lock:
+        if _active is session:
+            _active = None
+        if not session._ownership_released:
+            HARDWARE_COORDINATOR.release("capture")
+            session._ownership_released = True
 
 
 def _open_analyzer() -> usb.core.Device:
-    dev = usb.core.find(idVendor=ANALYZER_VID, idProduct=ANALYZER_PID)
-    if dev is None:
-        raise RuntimeError(
-            "Analyzer USB device not found at 1d50:615b. "
-            "Is the analyzer bitstream loaded? Try `switch_mode('analyzer')` first."
-        )
+    devices = list(usb.core.find(find_all=True, idVendor=ANALYZER_VID, idProduct=ANALYZER_PID) or [])
+    if len(devices) != 1:
+        raise RuntimeError("analyzer device unavailable or ambiguous")
+    device = devices[0]
     try:
-        dev.set_configuration()
+        device.set_configuration()
     except usb.core.USBError:
-        # Already configured — that's fine.
         pass
-    return dev
-
-
-def _vendor_write(dev: usb.core.Device, request: VendorRequest, value: int) -> None:
-    # bmRequestType: host-to-device | vendor | interface
-    dev.ctrl_transfer(
-        bmRequestType=0x41,
-        bRequest=int(request),
-        wValue=value,
-        wIndex=VENDOR_IFACE,
-        data_or_wLength=None,
-        timeout=1000,
-    )
+    return device
 
 
 def _set_state(dev: usb.core.Device, enable: bool, speed: CaptureSpeed) -> None:
-    state = (1 if enable else 0) | (int(speed) << 1)
-    _vendor_write(dev, VendorRequest.SET_STATE, state)
+    dev.ctrl_transfer(0x41, int(VendorRequest.SET_STATE), (1 if enable else 0) | (int(speed) << 1), VENDOR_IFACE, None, timeout=1000)
+
+
+def _finalize_file(session: CaptureSession, clean: bool) -> None:
+    if not clean:
+        _unlink_partial(session._partial_name, session._reservation_device, session._reservation_inode)
+        return
+    with storage_lock():
+        directory_fd = _dirfd()
+        try:
+            info = os.stat(session._partial_name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (info.st_dev, info.st_ino) != (session._reservation_device, session._reservation_inode):
+                raise RuntimeError("reserved capture changed")
+            os.link(session._partial_name, f"{session.id}.bin", src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd, follow_symlinks=False)
+            os.unlink(session._partial_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except Exception:
+            try:
+                _unlink_partial(session._partial_name, session._reservation_device, session._reservation_inode)
+            except Exception:
+                pass
+            raise
+        finally:
+            os.close(directory_fd)
+
+
+def _cleanup_device(session: CaptureSession) -> bool:
+    if session._dev is None:
+        return True
+    try:
+        _set_state(session._dev, False, CaptureSpeed.AUTO)
+    except Exception as exc:
+        session.error = session.error or _safe_error(exc)
+        return False
+    try:
+        usb.util.dispose_resources(session._dev)
+    except Exception as exc:
+        session.error = session.error or _safe_error(exc)
+        return False
+    session._dev = None
+    return True
 
 
 def start_capture(speed: Literal["auto", "high", "full", "low"] = "auto") -> CaptureSession:
-    global _active
+    global _active, _last_session
+    speed_norm = speed.lower()
+    if speed_norm not in SPEED_NAMES:
+        raise ValueError("unknown capture speed")
     with _lock:
-        if _active is not None and _active.finished_at is None:
-            raise RuntimeError(
-                f"a capture is already running (id={_active.id}); call stop_capture() first"
+        if _active is not None:
+            raise RuntimeError("a capture is already active")
+        HARDWARE_COORDINATOR.claim("capture")
+        session = None
+        try:
+            capture_id, partial_name, reservation_fd, reservation_info = _reserve_partial()
+            session = CaptureSession(
+                capture_id, speed_norm, time.time(), CAPTURES_DIR / f"{capture_id}.bin",
+                partial_name, reservation_info.st_ino, reservation_info.st_dev,
+                time.monotonic(), reservation_fd,
             )
+            device = _open_analyzer()
+            session._dev = device
+            _active = session
 
-        speed_norm = speed.lower()
-        if speed_norm not in SPEED_NAMES:
-            raise ValueError(
-                f"unknown speed {speed!r}; choose one of {list(SPEED_NAMES)}"
-            )
-        cs = SPEED_NAMES[speed_norm]
-
-        CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
-        capture_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
-        path = CAPTURES_DIR / f"{capture_id}.bin"
-
-        session = CaptureSession(
-            id=capture_id,
-            speed=speed_norm,
-            started_at=time.time(),
-            path=path,
-        )
-
-        dev = _open_analyzer()
-        _set_state(dev, enable=True, speed=cs)
-        session._dev = dev
-
-        def drainer():
-            # One USB handle owned by this thread for the lifetime of the
-            # capture. The drainer is also responsible for disabling capture
-            # and disposing the handle on exit, so we never have two threads
-            # claiming the same device.
-            try:
-                with path.open("wb") as fp:
-                    while not session._stop_flag.is_set():
+            def drainer() -> None:
+                global _last_session
+                clean = False
+                try:
+                    fd, session._reservation_fd = session._reservation_fd, None
+                    if fd is None:
+                        raise RuntimeError("capture reservation unavailable")
+                    with os.fdopen(fd, "wb", closefd=True) as output:
+                        _set_state(device, True, SPEED_NAMES[speed_norm])
+                        session._ready.set()
+                        while not session._stop_flag.is_set():
+                            if time.monotonic() - session._started_monotonic >= MAX_CAPTURE_SECONDS:
+                                session.error = "capture duration limit reached"
+                                break
+                            remaining = MAX_CAPTURE_BYTES - session.bytes_written
+                            if remaining <= 0:
+                                session.error = "capture byte limit reached"
+                                break
+                            try:
+                                chunk = device.read(BULK_ENDPOINT_ADDR, min(16384, remaining), timeout=200)
+                            except usb.core.USBTimeoutError:
+                                continue
+                            if chunk:
+                                output.write(chunk[:remaining])
+                                session.bytes_written += min(len(chunk), remaining)
+                                if len(chunk) >= remaining:
+                                    session.error = "capture byte limit reached"
+                                    break
+                        output.flush()
+                        os.fsync(output.fileno())
+                    clean = session.error is None and session._stop_flag.is_set()
+                except Exception as exc:
+                    session.error = session.error or _safe_error(exc)
+                    session._ready.set()
+                finally:
+                    cleaned = _cleanup_device(session)
+                    if cleaned:
                         try:
-                            chunk = dev.read(BULK_ENDPOINT_ADDR, 16384, timeout=200)
-                        except usb.core.USBTimeoutError:
-                            continue
-                        except Exception as e:
-                            session.error = f"{type(e).__name__}: {e}"
-                            break
-                        if chunk:
-                            fp.write(chunk)
-                            session.bytes_written += len(chunk)
-            finally:
-                # Disable the analyzer state register, then release the handle.
+                            _finalize_file(session, clean)
+                        except Exception as exc:
+                            session.error = session.error or _safe_error(exc)
+                        session.cleanup_confirmed = True
+                        session.finished_at = time.time()
+                        _last_session = session
+                        _release_session_ownership(session)
+                    else:
+                        try:
+                            _finalize_file(session, False)
+                        except Exception as exc:
+                            session.error = session.error or _safe_error(exc)
+                        session.finished_at = time.time()
+                        _last_session = session
+
+            session._thread = threading.Thread(target=drainer, daemon=False, name=f"capture-{capture_id}")
+            session._thread.start()
+        except Exception:
+            if session is not None:
+                if session._thread is not None and session._thread.ident is None:
+                    session._thread = None
+                _close_reservation(session)
                 try:
-                    _set_state(dev, enable=False, speed=CaptureSpeed.AUTO)
-                except Exception as e:
-                    log.warning("could not disable analyzer state: %s", e)
+                    _finalize_file(session, False)
+                except Exception:
+                    pass
+            disposed = session is None or session._dev is None
+            if session is not None and session._dev is not None:
                 try:
-                    usb.util.dispose_resources(dev)
-                except Exception as e:
-                    log.info("dispose_resources skipped: %s", e)
-                session.finished_at = time.time()
-
-        t = threading.Thread(target=drainer, daemon=True, name=f"capture-{capture_id}")
-        session._thread = t
-        t.start()
-
-        _active = session
-        log.info("capture %s started (speed=%s)", capture_id, speed_norm)
-        return session
-
-
-def stop_capture() -> CaptureSession:
-    global _active
-    with _lock:
-        if _active is None or _active.finished_at is not None:
-            raise RuntimeError("no active capture to stop")
-        session = _active
-
-    # Drainer disables analyzer state and disposes the USB handle in its
-    # finally block, so we just signal stop and wait.
-    session._stop_flag.set()
-    if session._thread is not None:
-        session._thread.join(timeout=3.0)
-
-    log.info(
-        "capture %s stopped (%d bytes, %.2f s)",
-        session.id,
-        session.bytes_written,
-        (session.finished_at or time.time()) - session.started_at,
-    )
+                    usb.util.dispose_resources(session._dev)
+                    session._dev = None
+                    disposed = True
+                except Exception as exc:
+                    session.error = session.error or _safe_error(exc)
+                    session.finished_at = time.time()
+                    _last_session = session
+            if disposed:
+                _active = None
+                HARDWARE_COORDINATOR.release("capture")
+            raise
+    session._ready.wait(STARTUP_TIMEOUT_SECONDS)
+    if not session._ready.is_set() or session.error or not session._thread.is_alive():
+        session.error = session.error or "capture startup failed"
+        session._stop_flag.set()
+        session._thread.join(STOP_TIMEOUT_SECONDS)
+        raise RuntimeError("capture startup failed")
     return session
 
 
+def stop_capture() -> CaptureSession:
+    with _lock:
+        if _active is None:
+            raise RuntimeError("no active capture")
+        session = _active
+        session._stop_flag.set()
+    with session._cleanup_lock:
+        if session._thread is not None:
+            session._thread.join(STOP_TIMEOUT_SECONDS)
+            if session._thread.is_alive():
+                raise RuntimeError("capture termination timed out")
+        if not session.cleanup_confirmed:
+            if not _cleanup_device(session):
+                raise RuntimeError("capture cleanup incomplete; retry stop")
+            session.cleanup_confirmed = True
+            _finalize_file(session, False)
+            _release_session_ownership(session)
+        if session.error:
+            raise RuntimeError("capture stopped with an error")
+        return session
+
+
 def list_captures() -> list[dict]:
-    if not CAPTURES_DIR.exists():
-        return []
-    out = []
-    for p in sorted(CAPTURES_DIR.glob("*.bin")):
-        st = p.stat()
-        out.append({
-            "id": p.stem,
-            "path": str(p),
-            "size": st.st_size,
-            "mtime": st.st_mtime,
-        })
-    return out
+    with storage_lock():
+        directory_fd = _dirfd()
+        try:
+            result: list[dict] = []
+            for entry in islice(os.scandir(directory_fd), MAX_DIRECTORY_SCAN):
+                name = entry.name
+                if not name.endswith(".bin") or not CAPTURE_ID_RE.fullmatch(name[:-4]):
+                    continue
+                try:
+                    info = _entry_regular(directory_fd, name)
+                except OSError:
+                    continue
+                result.append({"id": name[:-4], "size": info.st_size, "mtime": info.st_mtime})
+                if len(result) >= MAX_LIST_CAPTURES:
+                    break
+            return result
+        finally:
+            os.close(directory_fd)
 
 
 def read_capture_bytes(capture_id: str, offset: int = 0, length: int = 4096) -> bytes:
-    path = CAPTURES_DIR / f"{capture_id}.bin"
-    if not path.is_file():
-        raise FileNotFoundError(f"no capture with id {capture_id}")
-    with path.open("rb") as fp:
-        fp.seek(offset)
-        return fp.read(length)
+    if not isinstance(offset, int) or offset < 0 or not isinstance(length, int) or not 0 <= length <= MAX_RAW_READ_BYTES:
+        raise ValueError("invalid capture read range")
+    fd, _ = open_capture_fd(capture_id)
+    try:
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.read(fd, length)
+    finally:
+        os.close(fd)
 
 
-def session_status() -> dict | None:
-    if _active is None:
-        return None
-    return {
-        "id": _active.id,
-        "speed": _active.speed,
-        "started_at": _active.started_at,
-        "bytes_written": _active.bytes_written,
-        "finished_at": _active.finished_at,
-        "error": _active.error,
-        "path": str(_active.path),
-    }
+def _status(session: CaptureSession) -> dict:
+    return {"id": session.id, "speed": session.speed, "started_at": session.started_at,
+            "bytes_written": session.bytes_written, "finished_at": session.finished_at,
+            "terminal": session.finished_at is not None, "cleanup_confirmed": session.cleanup_confirmed,
+            "error": session.error}
+
+
+def session_status() -> dict:
+    with _lock:
+        session = _active or _last_session
+        return _status(session) if session is not None else {"terminal": True, "error": None}
