@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import io
 import os
 import stat
@@ -52,7 +53,6 @@ def modules(monkeypatch, tmp_path):
     coordinator = importlib.import_module("cynthion_mcp.coordinator")
     monkeypatch.setattr(coordinator, "LOCK_DIR", tmp_path / "state")
     monkeypatch.setattr(capture, "CAPTURES_DIR", tmp_path / "captures")
-    monkeypatch.setattr(tshark, "CAPTURES_DIR", tmp_path / "captures")
     return capture, decoder, tshark, hardware
 
 
@@ -308,6 +308,22 @@ def test_tshark_reader_has_one_deadline_and_reaps_group(modules, monkeypatch):
     assert terminated == [123]
 
 
+def test_tshark_helpers_do_not_mutate_capture_root_or_exceed_packet_cap(modules, monkeypatch):
+    capture, _, tshark, _ = modules
+    original_root = capture.CAPTURES_DIR
+    tshark._capture_paths(_valid_capture_id())
+    assert capture.CAPTURES_DIR == original_root
+    observed = []
+    monkeypatch.setattr(
+        tshark,
+        "_run_tshark",
+        lambda _path, _display_filter, limit: observed.append(limit) or [{}] * limit,
+    )
+    records, truncated = tshark.run_tshark_with_truncation(Path("capture.pcap"), tshark.MAX_TSHARK_PACKETS)
+    assert observed == [tshark.MAX_TSHARK_PACKETS]
+    assert len(records) == tshark.MAX_TSHARK_PACKETS and truncated is True
+
+
 def test_json_complexity_and_numeric_summary_limits(modules, monkeypatch):
     _, _, tshark, _ = modules
     monkeypatch.setattr(tshark, "MAX_JSON_DEPTH", 2)
@@ -376,11 +392,17 @@ def test_server_registers_exact_default_and_enabled_tools(monkeypatch):
     assert "emulate_device" not in server.__dict__
     converter_only, _ = _registered_tools(monkeypatch, "native-converter")
     assert converter_only == ["get_status", "list_captures", "convert_to_pcap"]
-    enabled, _ = _registered_tools(monkeypatch, "capture,raw-read,native-converter,tshark-decoder")
+    enabled, enabled_server = _registered_tools(monkeypatch, "capture,raw-read,native-converter,tshark-decoder")
     assert enabled == [
         "get_status", "capture_start", "capture_stop", "capture_status", "list_captures",
         "read_capture", "convert_to_pcap",
     ]
+    assert "force" not in inspect.signature(enabled_server.convert_to_pcap).parameters
+    enabled_server.capture.stop_capture = lambda: types.SimpleNamespace(
+        id="capture", speed="auto", started_at=1, finished_at=2, bytes_written=3, error="failed"
+    )
+    stopped = enabled_server.capture_stop()
+    assert stopped["error"] == "failed" and "terminal_error" not in stopped
 
 
 def test_emulator_public_api_is_fail_closed():

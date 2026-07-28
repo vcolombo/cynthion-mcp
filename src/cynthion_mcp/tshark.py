@@ -18,7 +18,6 @@ from typing import Any
 from . import capture
 from .decoder import MAX_PCAP_BYTES, ConversionResult, cynthion_bin_to_pcap
 
-CAPTURES_DIR = capture.CAPTURES_DIR
 MAX_TSHARK_PACKETS = 1_000
 MAX_TSHARK_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_TSHARK_SECONDS = 15
@@ -34,7 +33,6 @@ MAX_SUMMARY_TIME_SECONDS = 24 * 60 * 60
 
 def _capture_paths(capture_id: str) -> tuple[Path, Path]:
     capture._validate_id(capture_id)
-    capture.CAPTURES_DIR = CAPTURES_DIR
     status = capture.session_status()
     if not status["terminal"] and status.get("id") == capture_id:
         raise RuntimeError("capture is not complete")
@@ -272,8 +270,10 @@ def run_tshark(pcap_path: Path, display_filter: str | None = None, limit: int | 
 def run_tshark_with_truncation(pcap_path: Path, limit: int) -> tuple[list[dict], bool]:
     if not isinstance(limit, int) or not 1 <= limit <= MAX_TSHARK_PACKETS:
         raise ValueError("invalid tshark packet limit")
-    records = _run_tshark(pcap_path, None, limit + 1)
-    return records[:limit], len(records) > limit
+    probe_limit = min(limit + 1, MAX_TSHARK_PACKETS)
+    records = _run_tshark(pcap_path, None, probe_limit)
+    truncated = len(records) > limit or (limit == MAX_TSHARK_PACKETS and len(records) == limit)
+    return records[:limit], truncated
 
 
 def summarise_packet(packet: dict) -> dict:
