@@ -6,6 +6,7 @@ import inspect
 import io
 import os
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -404,6 +405,40 @@ def test_server_registers_exact_default_and_enabled_tools(monkeypatch):
     )
     stopped = enabled_server.capture_stop()
     assert stopped["error"] == "failed" and "terminal_error" not in stopped
+
+
+def test_real_fastmcp_registers_enabled_tools():
+    root = Path(__file__).parents[1]
+    env = os.environ.copy()
+    env["CYNTHION_MCP_ENABLE"] = "capture,raw-read,native-converter"
+    env["PYTHONPATH"] = str(root / "src")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import cynthion_mcp.server as s; "
+            "t=next(t for t in s.mcp._tool_manager.list_tools() if t.name=='capture_start'); "
+            "print(','.join(t.parameters['properties']['speed']['enum']))",
+        ],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "auto,high,full,low"
+
+
+def test_invalid_speed_is_rejected_before_hardware(modules, monkeypatch):
+    capture, _, _, _ = modules
+    monkeypatch.setattr(
+        capture.HARDWARE_COORDINATOR,
+        "claim",
+        lambda _owner: (_ for _ in ()).throw(AssertionError("hardware touched")),
+    )
+    with pytest.raises(ValueError, match="unknown capture speed"):
+        capture.start_capture("invalid")
 
 
 def test_emulator_public_api_is_fail_closed():
