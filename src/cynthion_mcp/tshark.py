@@ -75,7 +75,7 @@ def _remove_legacy_metadata(capture_id: str) -> None:
         os.close(directory_fd)
 
 
-def ensure_pcap(capture_id: str, *, force: bool = False) -> ConversionResult:
+def ensure_pcap(capture_id: str) -> ConversionResult:
     _, pcap_path = _capture_paths(capture_id)
     with capture.storage_lock():
         capture.require_storage_capacity(

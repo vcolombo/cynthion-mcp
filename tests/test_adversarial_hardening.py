@@ -259,6 +259,7 @@ def test_decoder_fails_closed_cleans_temp_and_bounds_output(modules, tmp_path, m
 
 def test_conversion_reprocesses_and_removes_legacy_metadata(modules, monkeypatch):
     capture, decoder, tshark, _ = modules
+    assert "force" not in inspect.signature(tshark.ensure_pcap).parameters
     capture._ensure_capture_dir()
     capture_id = _valid_capture_id()
     raw = capture.CAPTURES_DIR / f"{capture_id}.bin"
