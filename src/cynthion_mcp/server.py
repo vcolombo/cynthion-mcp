@@ -9,6 +9,7 @@ import sys
 from dataclasses import asdict
 from typing import Literal
 
+
 from mcp.server.fastmcp import FastMCP
 
 from . import capture, tshark as tshark_mod
@@ -19,7 +20,7 @@ _ENABLED = frozenset(item.strip() for item in os.environ.get("CYNTHION_MCP_ENABL
 
 
 def _safe(fn):
-    signature = inspect.signature(fn)
+    signature = inspect.signature(fn, eval_str=True)
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
