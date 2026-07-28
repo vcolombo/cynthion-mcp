@@ -1,84 +1,28 @@
-"""Cynthion native capture → pcap converter.
-
-Cynthion's analyzer applet emits a stream of 4-byte-aligned records.
-Each record starts on a 16-bit word boundary; the first byte distinguishes:
-
-  * **Event**  (4 bytes):  ``0xFF | event_code | timestamp_lo | timestamp_hi``
-    Event codes are defined in
-    ``cynthion.gateware.analyzer.events.USBAnalyzerEvent``.
-  * **Packet** (4 + N bytes): ``size_lo | size_hi | timestamp_lo | timestamp_hi``
-    followed by ``size`` bytes of raw on-the-wire USB packet (starts with PID).
-    ``size_lo`` can never be ``0xFF`` for a real packet — USB 2.0 limits
-    payload to 1024 bytes — so the leading-byte ambiguity is safe.
-
-The pcap output uses ``LINKTYPE_USB_2_0`` (288), the linktype consumed by both
-Packetry and Wireshark/tshark's USB dissector. Each packet record gets a
-timestamp derived from the cumulative USB-clock-tick count (60 MHz nominal),
-collapsed to seconds + microseconds.
-
-Events are intentionally NOT emitted into the pcap (no good linktype for them);
-they are summarised in the returned metadata.
-"""
-
+"""Strict, atomic Cynthion native capture → PCAP converter."""
 from __future__ import annotations
 
-import logging
+import os
+import stat
 import struct
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-log = logging.getLogger(__name__)
-
 LINKTYPE_USB_2_0 = 288
-
-PCAP_GLOBAL_HEADER = struct.pack(
-    "<IHHIIII",
-    0xA1B2C3D4,     # magic (microsecond timestamps)
-    2, 4,           # major, minor version
-    0,              # GMT to local correction
-    0,              # accuracy of timestamps
-    65535,          # snaplen
-    LINKTYPE_USB_2_0,
-)
-
-# Maps Cynthion event codes to human strings, mirroring USBAnalyzerEvent.
-EVENT_NAMES = {
-    0: "NONE",
-    1: "CAPTURE_STOP_NORMAL",
-    2: "CAPTURE_STOP_FULL",
-    3: "CAPTURE_STOP_ERROR",
-    4: "CAPTURE_START_HIGH_OR_AUTO",
-    5: "CAPTURE_START_FULL",
-    6: "CAPTURE_START_LOW",
-    7: "CAPTURE_START_AUTO",
-    8: "SPEED_DETECT_HIGH",
-    9: "SPEED_DETECT_FULL",
-    10: "SPEED_DETECT_LOW",
-    11: "SPEED_DETECT_AUTO",
-    12: "LINESTATE_SE0",
-    13: "LINESTATE_CHIRP_J",
-    14: "LINESTATE_CHIRP_K",
-    15: "LINESTATE_CHIRP_SE1",
-    16: "LINESTATE_LS_J",
-    17: "LINESTATE_LS_K",
-    18: "LINESTATE_FS_J",
-    19: "LINESTATE_FS_K",
-    20: "LINESTATE_SE1",
-    21: "VBUS_INVALID",
-    22: "VBUS_VALID",
-    23: "LS_ATTACH",
-    24: "FS_ATTACH",
-    25: "BUS_RESET",
-    26: "DEVICE_CHIRP_VALID",
-    27: "HOST_CHIRP_VALID",
-    28: "SUSPEND",
-    29: "RESUME",
-    30: "LS_KEEPALIVE",
-}
-
-# USB clock frequency used by the analyzer to derive timestamps.
+MAX_CONVERSION_BYTES = 64 * 1024 * 1024
+MAX_PCAP_BYTES = 128 * 1024 * 1024
+MAX_PACKET_BYTES = 1027
 USB_CLOCK_HZ = 60_000_000
+PCAP_GLOBAL_HEADER = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, LINKTYPE_USB_2_0)
+EVENT_NAMES = {0: "NONE", 1: "CAPTURE_STOP_NORMAL", 2: "CAPTURE_STOP_FULL", 3: "CAPTURE_STOP_ERROR", 4: "CAPTURE_START_HIGH_OR_AUTO", 5: "CAPTURE_START_FULL", 6: "CAPTURE_START_LOW", 7: "CAPTURE_START_AUTO", 8: "SPEED_DETECT_HIGH", 9: "SPEED_DETECT_FULL", 10: "SPEED_DETECT_LOW", 11: "SPEED_DETECT_AUTO", 12: "LINESTATE_SE0", 13: "LINESTATE_CHIRP_J", 14: "LINESTATE_CHIRP_K", 15: "LINESTATE_CHIRP_SE1", 16: "LINESTATE_LS_J", 17: "LINESTATE_LS_K", 18: "LINESTATE_FS_J", 19: "LINESTATE_FS_K", 20: "LINESTATE_SE1", 21: "VBUS_INVALID", 22: "VBUS_VALID", 23: "LS_ATTACH", 24: "FS_ATTACH", 25: "BUS_RESET", 26: "DEVICE_CHIRP_VALID", 27: "HOST_CHIRP_VALID", 28: "SUSPEND", 29: "RESUME", 30: "LS_KEEPALIVE"}
+
+
+class CaptureFormatError(ValueError):
+    """A corrupt or incomplete capture; ``offset`` is the last safe boundary."""
+    def __init__(self, message: str, offset: int):
+        super().__init__(f"{message} at offset {offset}")
+        self.offset = offset
 
 
 @dataclass
@@ -88,81 +32,104 @@ class ConversionResult:
     events: int
     bytes_consumed: int
     event_counts: dict[str, int]
-    speed: str | None  # "high" / "full" / "low" / "auto" / None
+    speed: str | None
     duration_us: float
 
 
-def cynthion_bin_to_pcap(src: Path, dst: Path) -> ConversionResult:
-    src = Path(src)
+def _read_exact(fp, size: int, offset: int) -> bytes:
+    data = fp.read(size)
+    if len(data) != size:
+        raise CaptureFormatError("truncated capture", offset)
+    return data
+
+
+def _valid_pid(pid: int) -> bool:
+    return ((pid & 0x0F) ^ (pid >> 4)) == 0x0F
+
+
+def cynthion_bin_to_pcap(src: Path | int, dst: Path, *, source_stat: os.stat_result | None = None) -> ConversionResult:
+    """Convert an already-opened capture descriptor or a local path atomically."""
     dst = Path(dst)
-
-    data = src.read_bytes()
-    pos = 0
-    cumulative_ticks = 0
-    packets = 0
-    events = 0
-    event_counts: Counter[str] = Counter()
-    speed: str | None = None
-
-    with dst.open("wb") as out:
-        out.write(PCAP_GLOBAL_HEADER)
-
-        while pos + 4 <= len(data):
-            b0 = data[pos]
-            if b0 == 0xFF:
-                # Event record (4 bytes). Each 16-bit word is BIG-ENDIAN on the
-                # wire — the gateware's Stream16to8 emits high byte first.
-                # The 16-bit "event word" itself is `Cat(event_code, 0xFF)`,
-                # which when serialised msb-first becomes `FF | event_code`,
-                # so the code lives in byte 1.
-                code = data[pos + 1]
-                timestamp = (data[pos + 2] << 8) | data[pos + 3]
+    owns_source = not isinstance(src, int)
+    source_fd = None
+    directory_fd = None
+    output_fd = None
+    temp_name = None
+    try:
+        source_fd = src if isinstance(src, int) else os.open(Path(src), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        actual_source = os.fstat(source_fd)
+        if not stat.S_ISREG(actual_source.st_mode):
+            raise ValueError("capture source is not a regular file")
+        if source_stat is not None and (source_stat.st_dev, source_stat.st_ino, source_stat.st_size) != (actual_source.st_dev, actual_source.st_ino, actual_source.st_size):
+            raise ValueError("capture source changed")
+        src_stat = source_stat or actual_source
+        if src_stat.st_size > MAX_CONVERSION_BYTES:
+            raise ValueError("capture exceeds conversion limit")
+        dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory_fd = os.open(dst.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        temp_name = f".{dst.name}.{os.getpid()}.{uuid.uuid4().hex}.partial"
+        output_fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=directory_fd)
+        os.fchmod(output_fd, 0o600)
+        pos = cumulative_ticks = packets = events = 0
+        output_bytes = len(PCAP_GLOBAL_HEADER)
+        event_counts: Counter[str] = Counter()
+        speed: str | None = None
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        output = os.fdopen(output_fd, "wb")
+        output_fd = None
+        with os.fdopen(os.dup(source_fd), "rb") as inp, output as out:
+            out.write(PCAP_GLOBAL_HEADER)
+            while pos < src_stat.st_size:
+                header = _read_exact(inp, 4, pos)
+                if header[0] == 0xFF:
+                    code, timestamp = header[1], (header[2] << 8) | header[3]
+                    cumulative_ticks += timestamp
+                    event_counts[EVENT_NAMES.get(code, f"UNKNOWN_{code:02x}")] += 1
+                    events += 1
+                    if code in (2, 3):
+                        raise CaptureFormatError("capture reports non-normal stop", pos)
+                    if code in (4, 5, 6, 7):
+                        speed = {4: "high", 5: "full", 6: "low", 7: "auto"}[code]
+                    pos += 4
+                    continue
+                size = (header[0] << 8) | header[1]
+                if not 1 <= size <= MAX_PACKET_BYTES:
+                    raise CaptureFormatError("invalid packet length", pos)
+                payload = _read_exact(inp, size, pos + 4)
+                if not _valid_pid(payload[0]):
+                    raise CaptureFormatError("invalid USB PID", pos + 4)
+                if size & 1:
+                    _read_exact(inp, 1, pos + 4 + size)
+                timestamp = (header[2] << 8) | header[3]
                 cumulative_ticks += timestamp
-                name = EVENT_NAMES.get(code, f"UNKNOWN_{code:02x}")
-                event_counts[name] += 1
-                events += 1
-                if code in (4, 5, 6, 7):
-                    speed = {4: "high", 5: "full", 6: "low", 7: "auto"}[code]
-                pos += 4
-                continue
-
-            # Packet header (4 bytes), big-endian 16-bit words:
-            #   size_hi | size_lo | time_hi | time_lo
-            size = (data[pos] << 8) | data[pos + 1]
-            if size == 0 or size > 1027:
-                # Bogus length — likely framing drift. Skip a word and retry.
-                pos += 2
-                continue
-            if pos + 4 + size > len(data):
-                # Truncated tail; stop gracefully.
-                break
-
-            timestamp = (data[pos + 2] << 8) | data[pos + 3]
-            cumulative_ticks += timestamp
-            payload = data[pos + 4 : pos + 4 + size]
-
-            # Convert cumulative USB ticks to seconds + microseconds.
-            seconds = cumulative_ticks // USB_CLOCK_HZ
-            usec_remainder_ticks = cumulative_ticks - seconds * USB_CLOCK_HZ
-            microseconds = (usec_remainder_ticks * 1_000_000) // USB_CLOCK_HZ
-
-            out.write(struct.pack(
-                "<IIII",
-                seconds, microseconds,
-                len(payload), len(payload),
-            ))
-            out.write(payload)
-            packets += 1
-            # Gateware writes everything 16-bit-aligned, so odd-size packets
-            # are followed by a single byte of padding. Advance past it.
-            pos += 4 + size + (size & 1)
-
-    return ConversionResult(
-        pcap_path=dst,
-        packets=packets,
-        events=events,
-        bytes_consumed=pos,
-        event_counts=dict(event_counts),
-        speed=speed,
-        duration_us=cumulative_ticks / USB_CLOCK_HZ * 1_000_000,
-    )
+                seconds, remainder = divmod(cumulative_ticks, USB_CLOCK_HZ)
+                microseconds = remainder * 1_000_000 // USB_CLOCK_HZ
+                output_bytes += 16 + size
+                if output_bytes > MAX_PCAP_BYTES:
+                    raise ValueError("pcap output exceeds conversion limit")
+                out.write(struct.pack("<IIII", seconds, microseconds, size, size))
+                out.write(payload)
+                packets += 1
+                pos += 4 + size + (size & 1)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp_name, dst.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        temp_name = None
+        final_fd = os.open(dst.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+        try:
+            os.fchmod(final_fd, 0o600)
+        finally:
+            os.close(final_fd)
+        return ConversionResult(dst, packets, events, pos, dict(event_counts), speed, cumulative_ticks / USB_CLOCK_HZ * 1_000_000)
+    finally:
+        if output_fd is not None:
+            os.close(output_fd)
+        if temp_name is not None and directory_fd is not None:
+            try:
+                os.unlink(temp_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if owns_source and source_fd is not None:
+            os.close(source_fd)
