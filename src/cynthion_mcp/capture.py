@@ -121,7 +121,7 @@ def packetry_running() -> bool:
             )
         except (OSError, subprocess.TimeoutExpired):
             return True
-        if result.returncode == 0:
+        if result.returncode != 1:
             return True
     return False
 

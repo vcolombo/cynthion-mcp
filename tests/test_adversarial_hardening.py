@@ -240,6 +240,16 @@ def test_packetry_detection_and_usb_claim_errors_are_actionable(modules, monkeyp
     assert missing.value.code == "hardware_missing"
 
 
+def test_packetry_operational_error_blocks_capture(modules, monkeypatch):
+    capture, _, _, _ = modules
+    monkeypatch.setattr(
+        capture.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 2),
+    )
+    assert capture.packetry_running() is True
+
+
 def test_capture_enable_usb_failure_is_actionable(modules, monkeypatch):
     capture, _, _, _ = modules
 
@@ -369,7 +379,7 @@ def test_decoder_fails_closed_cleans_temp_and_bounds_output(modules, tmp_path, m
 
     src.write_bytes(b"\x00\x01\x00\x00\xd2\x00")
     monkeypatch.setattr(decoder, "MAX_PCAP_BYTES", len(decoder.PCAP_GLOBAL_HEADER))
-    with pytest.raises(ValueError, match="pcap output"):
+    with pytest.raises(decoder.CaptureConversionError, match="pcap output"):
         decoder.cynthion_bin_to_pcap(src, dst)
     assert dst.read_bytes() == b"known-good"
 
@@ -589,6 +599,34 @@ def test_server_preflight_status_privacy_and_actionable_errors(monkeypatch):
     assert unknown["error"] == "internal_error"
     assert "secret" not in json.dumps(unknown)
     assert "/private" not in json.dumps(unknown)
+
+
+def test_conversion_limit_error_is_invalid_capture(monkeypatch, tmp_path):
+    _, server = _registered_tools(monkeypatch, "native-converter")
+    decoder = importlib.import_module("cynthion_mcp.decoder")
+    source = tmp_path / "capture.bin"
+    source.write_bytes(b"x")
+    monkeypatch.setattr(decoder, "MAX_CONVERSION_BYTES", 0)
+
+    with pytest.raises(decoder.CaptureConversionError) as raised:
+        decoder.cynthion_bin_to_pcap(source, tmp_path / "capture.pcap")
+
+    result = server._error_payload("convert_to_pcap", raised.value)
+    assert result["error"] == "invalid_capture"
+
+
+def test_conversion_output_limit_and_request_errors_stay_distinct(monkeypatch, tmp_path):
+    _, server = _registered_tools(monkeypatch, "native-converter")
+    decoder = importlib.import_module("cynthion_mcp.decoder")
+    source = tmp_path / "capture.bin"
+    source.write_bytes(b"\x00\x01\x00\x00\xd2\x00")
+    monkeypatch.setattr(decoder, "MAX_PCAP_BYTES", len(decoder.PCAP_GLOBAL_HEADER))
+
+    with pytest.raises(decoder.CaptureConversionError) as raised:
+        decoder.cynthion_bin_to_pcap(source, tmp_path / "capture.pcap")
+
+    assert server._error_payload("convert_to_pcap", raised.value)["error"] == "invalid_capture"
+    assert server._error_payload("convert_to_pcap", ValueError("invalid capture id"))["error"] == "invalid_request"
 
 
 def test_server_stop_and_convert_returns_verified_artifacts(monkeypatch):

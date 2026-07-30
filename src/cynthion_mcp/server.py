@@ -15,7 +15,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import capture, tshark as tshark_mod
 from .coordinator import HardwareBusyError
-from .decoder import CaptureFormatError, ConversionResult
+from .decoder import CaptureConversionError, ConversionResult
 from .hardware import Hardware
 
 log = logging.getLogger("cynthion_mcp")
@@ -38,7 +38,7 @@ def _error_payload(tool: str, exc: Exception) -> dict:
             "Cynthion is busy with another MCP operation.",
             "Wait for the active operation to finish, then retry.",
         ).payload(tool)
-    if isinstance(exc, CaptureFormatError):
+    if isinstance(exc, CaptureConversionError):
         return capture.CaptureError(
             "invalid_capture",
             "The capture is incomplete or invalid.",

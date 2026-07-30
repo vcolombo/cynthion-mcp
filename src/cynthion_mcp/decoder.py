@@ -18,7 +18,11 @@ PCAP_GLOBAL_HEADER = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, LINK
 EVENT_NAMES = {0: "NONE", 1: "CAPTURE_STOP_NORMAL", 2: "CAPTURE_STOP_FULL", 3: "CAPTURE_STOP_ERROR", 4: "CAPTURE_START_HIGH_OR_AUTO", 5: "CAPTURE_START_FULL", 6: "CAPTURE_START_LOW", 7: "CAPTURE_START_AUTO", 8: "SPEED_DETECT_HIGH", 9: "SPEED_DETECT_FULL", 10: "SPEED_DETECT_LOW", 11: "SPEED_DETECT_AUTO", 12: "LINESTATE_SE0", 13: "LINESTATE_CHIRP_J", 14: "LINESTATE_CHIRP_K", 15: "LINESTATE_CHIRP_SE1", 16: "LINESTATE_LS_J", 17: "LINESTATE_LS_K", 18: "LINESTATE_FS_J", 19: "LINESTATE_FS_K", 20: "LINESTATE_SE1", 21: "VBUS_INVALID", 22: "VBUS_VALID", 23: "LS_ATTACH", 24: "FS_ATTACH", 25: "BUS_RESET", 26: "DEVICE_CHIRP_VALID", 27: "HOST_CHIRP_VALID", 28: "SUSPEND", 29: "RESUME", 30: "LS_KEEPALIVE"}
 
 
-class CaptureFormatError(ValueError):
+class CaptureConversionError(ValueError):
+    """A capture that cannot be converted safely."""
+
+
+class CaptureFormatError(CaptureConversionError):
     """A corrupt or incomplete capture; ``offset`` is the last safe boundary."""
     def __init__(self, message: str, offset: int):
         super().__init__(f"{message} at offset {offset}")
@@ -59,12 +63,12 @@ def cynthion_bin_to_pcap(src: Path | int, dst: Path, *, source_stat: os.stat_res
         source_fd = src if isinstance(src, int) else os.open(Path(src), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         actual_source = os.fstat(source_fd)
         if not stat.S_ISREG(actual_source.st_mode):
-            raise ValueError("capture source is not a regular file")
+            raise CaptureConversionError("capture source is not a regular file")
         if source_stat is not None and (source_stat.st_dev, source_stat.st_ino, source_stat.st_size) != (actual_source.st_dev, actual_source.st_ino, actual_source.st_size):
-            raise ValueError("capture source changed")
+            raise CaptureConversionError("capture source changed")
         src_stat = source_stat or actual_source
         if src_stat.st_size > MAX_CONVERSION_BYTES:
-            raise ValueError("capture exceeds conversion limit")
+            raise CaptureConversionError("capture exceeds conversion limit")
         dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory_fd = os.open(dst.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
         temp_name = f".{dst.name}.{os.getpid()}.{uuid.uuid4().hex}.partial"
@@ -106,7 +110,7 @@ def cynthion_bin_to_pcap(src: Path | int, dst: Path, *, source_stat: os.stat_res
                 microseconds = remainder * 1_000_000 // USB_CLOCK_HZ
                 output_bytes += 16 + size
                 if output_bytes > MAX_PCAP_BYTES:
-                    raise ValueError("pcap output exceeds conversion limit")
+                    raise CaptureConversionError("pcap output exceeds conversion limit")
                 out.write(struct.pack("<IIII", seconds, microseconds, size, size))
                 out.write(payload)
                 packets += 1
