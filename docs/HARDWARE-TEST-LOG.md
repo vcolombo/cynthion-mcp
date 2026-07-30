@@ -24,7 +24,7 @@ Facedancer/emulation paths.
 
 ## Historical upstream evidence (commit `057b794`)
 
-Historical observations at commit `057b794` are retained only for attribution
-and context. They are not current validation of Facedancer emulation,
+This historical upstream evidence is retained only for attribution and context.
+It is not current validation of Facedancer emulation,
 descriptor cloning, serial injection, or emulator diagnosis; those capabilities
 remain intentionally unsupported by this hardened branch.
