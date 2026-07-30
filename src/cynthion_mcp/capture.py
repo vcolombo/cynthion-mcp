@@ -214,6 +214,24 @@ def open_capture_fd(capture_id: str, suffix: str = ".bin") -> tuple[int, os.stat
         raise
 
 
+def _capture_record(name: str) -> str:
+    for suffix in (".pcap.json", ".partial", ".bin", ".pcap"):
+        if name.endswith(suffix) and CAPTURE_ID_RE.fullmatch(name.removesuffix(suffix)):
+            return name.removesuffix(suffix)
+    parts = name.split(".")
+    if (
+        len(parts) == 6
+        and not parts[0]
+        and CAPTURE_ID_RE.fullmatch(parts[1])
+        and parts[2] == "pcap"
+        and parts[3].isdigit()
+        and re.fullmatch(r"[0-9a-f]{32}", parts[4])
+        and parts[5] == "partial"
+    ):
+        return parts[1]
+    return name
+
+
 def _stored_usage(directory_fd: int) -> tuple[int, int]:
     records: set[str] = set()
     total = 0
@@ -224,12 +242,7 @@ def _stored_usage(directory_fd: int) -> tuple[int, int]:
             continue
         if entry.name == STORAGE_LOCK_NAME or not stat.S_ISREG(info.st_mode):
             continue
-        record = entry.name
-        for suffix in (".pcap.json", ".partial", ".bin", ".pcap"):
-            if entry.name.endswith(suffix) and CAPTURE_ID_RE.fullmatch(entry.name.removesuffix(suffix)):
-                record = entry.name.removesuffix(suffix)
-                break
-        records.add(record)
+        records.add(_capture_record(entry.name))
         total += MAX_CAPTURE_BYTES if entry.name.endswith(".partial") else info.st_size
     return len(records), total
 

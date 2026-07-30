@@ -435,6 +435,12 @@ def test_conversion_at_capture_record_limit_does_not_consume_extra_entry(modules
     capture_ids = [f"20260728-123456-{index:06x}" for index in range(capture.MAX_STORED_CAPTURES)]
     for capture_id in capture_ids:
         (capture.CAPTURES_DIR / f"{capture_id}.bin").write_bytes(b"\xff\x04\x00\x00")
+    target = capture_ids[0]
+    (capture.CAPTURES_DIR / f"{target}.pcap").write_bytes(b"old")
+    legacy = capture.CAPTURES_DIR / f"{target}.pcap.json"
+    legacy.write_text("legacy")
+    orphan = capture.CAPTURES_DIR / f".{target}.pcap.123.{'a' * 32}.partial"
+    orphan.write_bytes(b"orphan")
 
     def convert(fd, dst, *, source_stat=None):
         Path(dst).write_bytes(b"pcap")
@@ -452,7 +458,9 @@ def test_conversion_at_capture_record_limit_does_not_consume_extra_entry(modules
     with pytest.raises(capture.CaptureError) as quota:
         capture._reserve_partial()
     assert quota.value.code == "storage_quota"
-    assert (capture.CAPTURES_DIR / f"{capture_ids[0]}.pcap").read_bytes() == b"pcap"
+    assert not legacy.exists()
+    assert orphan.exists()
+    assert (capture.CAPTURES_DIR / f"{target}.pcap").read_bytes() == b"pcap"
 
 
 def test_tshark_requires_verified_executable_hash(modules, monkeypatch, tmp_path):
