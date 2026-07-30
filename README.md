@@ -62,8 +62,10 @@ and target interactions remain operator actions.
 
 ## Hardware validation
 
-No current hardware validation is claimed by this hardened branch. See
-`docs/HARDWARE-TEST-LOG.md` only as historical upstream evidence.
+A live headless capture/convert canary passed on the M4 control host for version
+`0.1.0`. See `docs/HARDWARE-TEST-LOG.md` for the commit, counts, and artifact
+hashes. Facedancer/emulation paths remain intentionally unvalidated and
+unsupported.
 
 ## License and attribution
 
