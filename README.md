@@ -12,9 +12,18 @@ architecture with its own review.
 
 The default server exposes exactly `get_status` and `list_captures`. Operator
 capabilities enable only their matching tools: `capture`, `raw-read`, and
-`native-converter` (pure capture-to-PCAP conversion). Mode switching, recovery,
-firmware, bitstream mutation, and tshark execution are not exposed through MCP.
-Packetry or an operator-controlled local tshark process can inspect exported PCAPs.
+`native-converter` (pure capture-to-PCAP conversion). The `capture` capability
+adds preflight, start, bounded wait, stop, and status tools;
+`capture_stop_and_convert` requires both `capture` and `native-converter`.
+Mode switching, recovery, firmware, bitstream mutation, and tshark execution
+are not exposed through MCP. Packetry or an operator-controlled local tshark
+process can inspect exported PCAPs.
+
+`capture_preflight` uses a fixed `/usr/bin/pgrep` invocation with no shell or
+user-controlled arguments to report Packetry ownership before touching USB.
+It never terminates Packetry and treats an unavailable/timed-out process probe
+as busy. Tool failures return fixed redacted error codes, recoverability, and a
+next action; raw USB exceptions are only reduced to coarse categories.
 
 If an operator uses the optional host-side tshark helper directly, it requires
 an absolute `CYNTHION_MCP_TSHARK` path and the lowercase SHA-256 digest of that
@@ -39,6 +48,17 @@ PYTHONPATH=src uv run python -m pytest tests -q
 
 The project pins direct dependencies and `setuptools==82.0.1`; setup and CI use
 the committed `uv.lock` exclusively.
+
+## Headless capture workflow
+
+1. `capture_preflight`
+2. `capture_start(speed="full")` when the bus speed is known
+3. Generate target traffic; `capture_wait(min_bytes=4096, timeout_seconds=30)`
+4. `capture_stop_and_convert`
+
+The final call returns capture/PCAP names, packet and event counts, duration,
+and SHA-256 digests for both artifacts. Physical cable changes, target power,
+and target interactions remain operator actions.
 
 ## Hardware validation
 

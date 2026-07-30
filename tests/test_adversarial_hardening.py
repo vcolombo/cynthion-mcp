@@ -171,8 +171,9 @@ def test_initialization_cleanup_failure_preserves_retryable_ownership(modules, m
         capture.HARDWARE_COORDINATOR.claim("conflict")
 
     monkeypatch.setattr(capture.usb.util, "dispose_resources", lambda _device: None)
-    with pytest.raises(RuntimeError, match="stopped with an error"):
+    with pytest.raises(capture.CaptureError) as error:
         capture.stop_capture()
+    assert error.value.code == "cleanup_failed"
     capture.HARDWARE_COORDINATOR.claim("after-cleanup")
     capture.HARDWARE_COORDINATOR.release("after-cleanup")
 
@@ -206,7 +207,121 @@ def test_startup_timeout_can_never_publish_clean_capture(modules, monkeypatch):
     with pytest.raises(RuntimeError, match="startup failed"):
         capture.start_capture()
     assert not list(capture.CAPTURES_DIR.glob("*.bin"))
-    assert capture.session_status()["error"] == "capture startup failed"
+    assert capture.session_status()["error_code"] == "capture_start_failed"
+
+
+def test_packetry_detection_and_usb_claim_errors_are_actionable(modules, monkeypatch):
+    capture, _, _, _ = modules
+    calls = []
+
+    def running(args, **kwargs):
+        calls.append((args, kwargs))
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(capture.subprocess, "run", running)
+    assert capture.packetry_running() is True
+    assert calls[0][0] == ["/usr/bin/pgrep", "-x", "Packetry"]
+    assert "shell" not in calls[0][1]
+    with pytest.raises(capture.CaptureError) as packetry:
+        capture._open_analyzer()
+    assert packetry.value.code == "packetry_busy"
+
+    monkeypatch.setattr(
+        capture.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("blocked")),
+    )
+    assert capture.packetry_running() is True
+
+    monkeypatch.setattr(capture, "packetry_running", lambda: False)
+    monkeypatch.setattr(capture.usb.core, "find", lambda **_kwargs: [])
+    with pytest.raises(capture.CaptureError) as missing:
+        capture._open_analyzer()
+    assert missing.value.code == "hardware_missing"
+
+
+def test_capture_enable_usb_failure_is_actionable(modules, monkeypatch):
+    capture, _, _, _ = modules
+
+    class Device:
+        calls = 0
+
+        def ctrl_transfer(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise capture.usb.core.USBError()
+            return None
+
+    monkeypatch.setattr(capture, "_open_analyzer", Device)
+    with pytest.raises(capture.CaptureError) as claim:
+        capture.start_capture("full")
+    assert claim.value.code == "usb_claim_failed"
+    assert "Packetry" in claim.value.next_action
+    assert capture._active is None
+
+
+def test_capture_wait_is_bounded_and_reports_traffic(modules):
+    capture, _, _, _ = modules
+    session = capture.CaptureSession(
+        _valid_capture_id(), "full", 1.0, Path("x"), "x.partial", 1, 1, time.monotonic()
+    )
+    capture._active = session
+    session.bytes_written = 32
+    status = capture.wait_for_capture(min_bytes=16, timeout_seconds=0)
+    assert status["traffic_seen"] is True
+    assert status["bytes_written"] == 32
+
+    session.bytes_written = 0
+    assert capture.wait_for_capture(min_bytes=1, timeout_seconds=0)["traffic_seen"] is False
+    with pytest.raises(ValueError, match="bounds"):
+        capture.wait_for_capture(min_bytes=0)
+    capture._active = None
+    with pytest.raises(capture.CaptureError) as missing:
+        capture.wait_for_capture()
+    assert missing.value.code == "no_active_capture"
+
+
+def test_capture_hash_uses_confined_capture_files(modules):
+    capture, _, _, _ = modules
+    capture._ensure_capture_dir()
+    capture_id = _valid_capture_id()
+    (capture.CAPTURES_DIR / f"{capture_id}.bin").write_bytes(b"capture")
+    assert capture.capture_file_sha256(capture_id, ".bin") == (
+        "460ee6aa3a80359181b794cc31a7185addba77626e9f719c10e3c8efb8668a1d"
+    )
+    with pytest.raises(ValueError, match="suffix"):
+        capture.capture_file_sha256(capture_id, "../../secret")
+
+
+def test_headless_capture_flow_persists_converts_and_hashes(modules, monkeypatch):
+    capture, _, tshark, _ = modules
+
+    class Device:
+        sent = False
+
+        def ctrl_transfer(self, *_args, **_kwargs):
+            return None
+
+        def read(self, *_args, **_kwargs):
+            if not self.sent:
+                self.sent = True
+                return b"\xff\x05\x00\x00"
+            time.sleep(0.005)
+            raise capture.usb.core.USBTimeoutError()
+
+    monkeypatch.setattr(capture, "packetry_running", lambda: False)
+    monkeypatch.setattr(capture, "_open_analyzer", Device)
+    session = capture.start_capture("full")
+    assert capture.wait_for_capture(4, 1)["traffic_seen"] is True
+    stopped = capture.stop_capture()
+    assert stopped.cleanup_confirmed is True
+    assert stopped.path.read_bytes() == b"\xff\x05\x00\x00"
+
+    converted = tshark.ensure_pcap(session.id)
+    assert converted.speed == "full"
+    assert converted.events == 1 and converted.packets == 0
+    assert len(capture.capture_file_sha256(session.id, ".bin")) == 64
+    assert len(capture.capture_file_sha256(session.id, ".pcap")) == 64
 
 
 def test_listing_is_lazy_bounded_and_paths_are_confined(modules, monkeypatch):
@@ -397,15 +512,109 @@ def test_server_registers_exact_default_and_enabled_tools(monkeypatch):
     assert converter_only == ["get_status", "list_captures", "convert_to_pcap"]
     enabled, enabled_server = _registered_tools(monkeypatch, "capture,raw-read,native-converter,tshark-decoder")
     assert enabled == [
-        "get_status", "capture_start", "capture_stop", "capture_status", "list_captures",
-        "read_capture", "convert_to_pcap",
+        "get_status", "capture_preflight", "capture_start", "capture_wait", "capture_stop",
+        "capture_stop_and_convert", "capture_status", "list_captures", "read_capture",
+        "convert_to_pcap",
     ]
     assert "force" not in inspect.signature(enabled_server.convert_to_pcap).parameters
     enabled_server.capture.stop_capture = lambda: types.SimpleNamespace(
         id="capture", speed="auto", started_at=1, finished_at=2, bytes_written=3, error="failed"
     )
+    enabled_server.capture._status = lambda _session: {"error": "failed"}
     stopped = enabled_server.capture_stop()
     assert stopped["error"] == "failed" and "terminal_error" not in stopped
+
+    capture_only, _ = _registered_tools(monkeypatch, "capture")
+    assert "capture_stop_and_convert" not in capture_only
+
+
+def test_server_preflight_status_privacy_and_actionable_errors(monkeypatch):
+    _, server = _registered_tools(monkeypatch, "capture,raw-read,native-converter")
+    hardware = importlib.import_module("cynthion_mcp.hardware")
+    board = hardware.BoardStatus(True, "stub", "USB Analyzer", 0x1D50, 0x615B, None, None)
+    server._hw = types.SimpleNamespace(get_status=lambda: board)
+    server.capture.session_status = lambda: {"terminal": True, "error": None}
+    server.capture.packetry_running = lambda: True
+
+    busy = server.capture_preflight()
+    assert busy["ready"] is False and busy["error"] == "packetry_busy"
+    assert busy["next_action"].startswith("Close Packetry")
+
+    server.capture.packetry_running = lambda: False
+    server._hw = types.SimpleNamespace(
+        get_status=lambda: hardware.BoardStatus(False, "missing", None, None, None, None, None)
+    )
+    missing = server.capture_preflight()
+    assert missing["error"] == "hardware_missing"
+
+    server._hw = types.SimpleNamespace(
+        get_status=lambda: hardware.BoardStatus(True, "stub", "Facedancer", 0x1D50, 0x615B, None, None)
+    )
+    wrong = server.capture_preflight()
+    assert wrong["error"] == "wrong_bitstream"
+
+    server._hw = types.SimpleNamespace(get_status=lambda: board)
+    ready = server.capture_preflight()
+    assert ready["ready"] is True
+    assert "serial_number" not in ready["board"]
+
+    monkeypatch.setenv("CYNTHION_MCP_BUILD_COMMIT", "e75ac9b")
+    status = server.get_status()
+    assert status["service"]["build_commit"] == "e75ac9b"
+    assert status["service"]["capabilities"] == ["capture", "native-converter", "raw-read"]
+    assert "serial_number" not in status
+
+    def fail(_speed):
+        raise server.capture.CaptureError(
+            "usb_claim_failed",
+            "The analyzer USB interface could not be claimed.",
+            "Close Packetry and other analyzer clients, then retry.",
+        )
+
+    server.capture.start_capture = fail
+    error = server.capture_start("full")
+    assert error == {
+        "ok": False,
+        "tool": "capture_start",
+        "error": "usb_claim_failed",
+        "message": "The analyzer USB interface could not be claimed.",
+        "recoverable": True,
+        "next_action": "Close Packetry and other analyzer clients, then retry.",
+    }
+
+    server.capture.start_capture = lambda _speed: (_ for _ in ()).throw(
+        RuntimeError("serial=secret path=/private/device")
+    )
+    unknown = server.capture_start("full")
+    assert unknown["error"] == "internal_error"
+    assert "secret" not in json.dumps(unknown)
+    assert "/private" not in json.dumps(unknown)
+
+
+def test_server_stop_and_convert_returns_verified_artifacts(monkeypatch):
+    _, server = _registered_tools(monkeypatch, "capture,native-converter")
+    session = types.SimpleNamespace(id=_valid_capture_id())
+    server.capture.stop_capture = lambda: session
+    server.capture._status = lambda _session: {
+        "id": _valid_capture_id(),
+        "bytes_written": 128,
+        "terminal": True,
+        "error": None,
+    }
+    server.capture.capture_file_sha256 = lambda _capture_id, suffix: {
+        ".bin": "a" * 64,
+        ".pcap": "b" * 64,
+    }[suffix]
+    server.tshark_mod.ensure_pcap = lambda _capture_id: server.ConversionResult(
+        Path("capture.pcap"), 12, 2, 128, {"CAPTURE_START_FULL": 1}, "full", 2_000_000
+    )
+
+    result = server.capture_stop_and_convert()
+    assert result["ok"] is True
+    assert result["pcap"] == f"{_valid_capture_id()}.pcap"
+    assert result["packets"] == 12 and result["duration_s"] == 2
+    assert result["raw_sha256"] == "a" * 64
+    assert result["pcap_sha256"] == "b" * 64
 
 
 def test_real_fastmcp_registers_enabled_tools():
@@ -418,8 +627,10 @@ def test_real_fastmcp_registers_enabled_tools():
             sys.executable,
             "-c",
             "import json; import cynthion_mcp.server as s; "
-            "t=next(t for t in s.mcp._tool_manager.list_tools() if t.name=='capture_start'); "
-            "print(json.dumps(t.parameters['properties']['speed']['enum']))",
+            "tools=s.mcp._tool_manager.list_tools(); "
+            "start=next(t for t in tools if t.name=='capture_start'); "
+            "print(json.dumps({'names':[t.name for t in tools], "
+            "'speed':start.parameters['properties']['speed']['enum']}))",
         ],
         cwd=root,
         env=env,
@@ -428,7 +639,13 @@ def test_real_fastmcp_registers_enabled_tools():
         timeout=10,
     )
     assert result.returncode == 0, result.stderr
-    assert set(json.loads(result.stdout)) == {"auto", "high", "full", "low"}
+    discovered = json.loads(result.stdout)
+    assert discovered["names"] == [
+        "get_status", "capture_preflight", "capture_start", "capture_wait", "capture_stop",
+        "capture_stop_and_convert", "capture_status", "list_captures", "read_capture",
+        "convert_to_pcap",
+    ]
+    assert set(discovered["speed"]) == {"auto", "high", "full", "low"}
 
 
 def test_invalid_speed_is_rejected_before_hardware(modules, monkeypatch):

@@ -27,7 +27,6 @@ class BoardStatus:
     vendor_id: int | None
     product_id: int | None
     hardware: str | None
-    serial_number: str | None
     firmware_version: str | None
 
 
@@ -37,7 +36,7 @@ class Hardware:
         with HARDWARE_COORDINATOR.operation("status"):
             device = self._find_gsg_device()
             if device is None:
-                return BoardStatus(False, "missing", None, None, None, None, None, None)
+                return BoardStatus(False, "missing", None, None, None, None, None)
             mode = "mcu_direct" if device.idProduct == APOLLO_MCU_PID else "stub"
             return BoardStatus(
                 connected=True,
@@ -46,7 +45,6 @@ class Hardware:
                 vendor_id=device.idVendor,
                 product_id=device.idProduct,
                 hardware=None,
-                serial_number=self._usb_string(device, getattr(device, "iSerialNumber", 0)),
                 firmware_version=None,
             )
 
