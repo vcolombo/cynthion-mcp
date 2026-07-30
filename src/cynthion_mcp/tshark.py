@@ -79,7 +79,7 @@ def ensure_pcap(capture_id: str) -> ConversionResult:
     _, pcap_path = _capture_paths(capture_id)
     with capture.storage_lock():
         capture.require_storage_capacity(
-            1,
+            0,
             MAX_PCAP_BYTES,
             replacing=(f"{capture_id}.pcap",),
         )

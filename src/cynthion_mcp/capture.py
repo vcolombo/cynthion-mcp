@@ -1,10 +1,12 @@
 """Sniffer-mode capture lifecycle with descriptor-relative private storage."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
 import stat
+import subprocess
 import threading
 import time
 import uuid
@@ -37,6 +39,26 @@ ID_RESERVATION_ATTEMPTS = 16
 STORAGE_LOCK_NAME = ".storage.lock"
 STARTUP_TIMEOUT_SECONDS = 5.0
 STOP_TIMEOUT_SECONDS = 5.0
+MAX_WAIT_SECONDS = 90.0
+
+
+class CaptureError(RuntimeError):
+    def __init__(self, code: str, message: str, next_action: str, recoverable: bool = True):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.next_action = next_action
+        self.recoverable = recoverable
+
+    def payload(self, tool: str) -> dict:
+        return {
+            "ok": False,
+            "tool": tool,
+            "error": self.code,
+            "message": self.message,
+            "recoverable": self.recoverable,
+            "next_action": self.next_action,
+        }
 
 
 class VendorRequest(IntEnum):
@@ -70,6 +92,9 @@ class CaptureSession:
     bytes_written: int = 0
     finished_at: float | None = None
     error: str | None = None
+    error_code: str | None = None
+    next_action: str | None = None
+    recoverable: bool | None = None
     cleanup_confirmed: bool = False
     _ownership_released: bool = field(default=False, repr=False)
     _cleanup_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -82,8 +107,37 @@ _root_lock = threading.Lock()
 _capture_root_identity: tuple[int, int] | None = None
 
 
-def _safe_error(exc: Exception) -> str:
-    return type(exc).__name__
+def packetry_running() -> bool:
+    for name in ("Packetry", "packetry"):
+        try:
+            result = subprocess.run(
+                ["/usr/bin/pgrep", "-x", name],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+                timeout=1,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+        if result.returncode != 1:
+            return True
+    return False
+
+
+def _set_session_error(
+    session: CaptureSession,
+    code: str,
+    message: str,
+    next_action: str,
+    recoverable: bool = True,
+) -> None:
+    if session.error is None:
+        session.error = message
+        session.error_code = code
+        session.next_action = next_action
+        session.recoverable = recoverable
 
 
 def _ensure_capture_dir() -> None:
@@ -160,8 +214,27 @@ def open_capture_fd(capture_id: str, suffix: str = ".bin") -> tuple[int, os.stat
         raise
 
 
+def _capture_record(name: str) -> str:
+    for suffix in (".pcap.json", ".partial", ".bin", ".pcap"):
+        if name.endswith(suffix) and CAPTURE_ID_RE.fullmatch(name.removesuffix(suffix)):
+            return name.removesuffix(suffix)
+    parts = name.split(".")
+    if (
+        len(parts) == 6
+        and not parts[0]
+        and CAPTURE_ID_RE.fullmatch(parts[1])
+        and parts[2] == "pcap"
+        and parts[3].isdigit()
+        and re.fullmatch(r"[0-9a-f]{32}", parts[4])
+        and parts[5] == "partial"
+    ):
+        return parts[1]
+    return name
+
+
 def _stored_usage(directory_fd: int) -> tuple[int, int]:
-    count = total = 0
+    records: set[str] = set()
+    total = 0
     for entry in os.scandir(directory_fd):
         try:
             info = entry.stat(follow_symlinks=False)
@@ -169,9 +242,9 @@ def _stored_usage(directory_fd: int) -> tuple[int, int]:
             continue
         if entry.name == STORAGE_LOCK_NAME or not stat.S_ISREG(info.st_mode):
             continue
-        count += 1
-        total += MAX_CAPTURE_BYTES if entry.name.endswith(".partial") else info.st_size
-    return count, total
+        records.add(_capture_record(entry.name))
+        total += max(MAX_CAPTURE_BYTES, info.st_size) if entry.name.endswith(".partial") else info.st_size
+    return len(records), total
 
 
 @contextmanager
@@ -206,10 +279,14 @@ def require_storage_capacity(additional_entries: int, additional_bytes: int, rep
                 info = _entry_regular(directory_fd, name)
             except OSError:
                 continue
-            count -= 1
             total -= info.st_size
         if count + additional_entries > MAX_STORED_CAPTURES or total + additional_bytes > MAX_STORED_BYTES:
-            raise RuntimeError("capture storage quota reached")
+            raise CaptureError(
+                "storage_quota",
+                "Capture storage quota is full.",
+                "Archive captures outside the managed directory, then retry.",
+                False,
+            )
     finally:
         os.close(directory_fd)
 
@@ -272,9 +349,25 @@ def _release_session_ownership(session: CaptureSession) -> None:
 
 
 def _open_analyzer() -> usb.core.Device:
+    if packetry_running():
+        raise CaptureError(
+            "packetry_busy",
+            "Packetry is using the analyzer.",
+            "Close Packetry, then run capture_preflight again.",
+        )
     devices = list(usb.core.find(find_all=True, idVendor=ANALYZER_VID, idProduct=ANALYZER_PID) or [])
+    if not devices:
+        raise CaptureError(
+            "hardware_missing",
+            "Cynthion USB Analyzer is not connected.",
+            "Connect Cynthion CONTROL, then run capture_preflight again.",
+        )
     if len(devices) != 1:
-        raise RuntimeError("analyzer device unavailable or ambiguous")
+        raise CaptureError(
+            "hardware_ambiguous",
+            "Multiple Cynthion analyzers are connected.",
+            "Leave exactly one analyzer connected, then retry.",
+        )
     device = devices[0]
     try:
         device.set_configuration()
@@ -316,13 +409,23 @@ def _cleanup_device(session: CaptureSession) -> bool:
         return True
     try:
         _set_state(session._dev, False, CaptureSpeed.AUTO)
-    except Exception as exc:
-        session.error = session.error or _safe_error(exc)
+    except Exception:
+        _set_session_error(
+            session,
+            "cleanup_failed",
+            "Capture cleanup failed.",
+            "Retry capture_stop; do not start another capture.",
+        )
         return False
     try:
         usb.util.dispose_resources(session._dev)
-    except Exception as exc:
-        session.error = session.error or _safe_error(exc)
+    except Exception:
+        _set_session_error(
+            session,
+            "cleanup_failed",
+            "Capture cleanup failed.",
+            "Retry capture_stop; do not start another capture.",
+        )
         return False
     session._dev = None
     return True
@@ -335,7 +438,11 @@ def start_capture(speed: Literal["auto", "high", "full", "low"] = "auto") -> Cap
         raise ValueError("unknown capture speed")
     with _lock:
         if _active is not None:
-            raise RuntimeError("a capture is already active")
+            raise CaptureError(
+                "capture_active",
+                "A capture is already active.",
+                "Use capture_status, capture_wait, or capture_stop_and_convert.",
+            )
         HARDWARE_COORDINATOR.claim("capture")
         session = None
         try:
@@ -361,11 +468,23 @@ def start_capture(speed: Literal["auto", "high", "full", "low"] = "auto") -> Cap
                         session._ready.set()
                         while not session._stop_flag.is_set():
                             if time.monotonic() - session._started_monotonic >= MAX_CAPTURE_SECONDS:
-                                session.error = "capture duration limit reached"
+                                _set_session_error(
+                                    session,
+                                    "duration_limit",
+                                    "Capture duration limit reached.",
+                                    "Start a shorter capture; limit-ended data is not published.",
+                                    False,
+                                )
                                 break
                             remaining = MAX_CAPTURE_BYTES - session.bytes_written
                             if remaining <= 0:
-                                session.error = "capture byte limit reached"
+                                _set_session_error(
+                                    session,
+                                    "byte_limit",
+                                    "Capture byte limit reached.",
+                                    "Start a shorter capture; limit-ended data is not published.",
+                                    False,
+                                )
                                 break
                             try:
                                 chunk = device.read(BULK_ENDPOINT_ADDR, min(16384, remaining), timeout=200)
@@ -375,21 +494,50 @@ def start_capture(speed: Literal["auto", "high", "full", "low"] = "auto") -> Cap
                                 output.write(chunk[:remaining])
                                 session.bytes_written += min(len(chunk), remaining)
                                 if len(chunk) >= remaining:
-                                    session.error = "capture byte limit reached"
+                                    _set_session_error(
+                                        session,
+                                        "byte_limit",
+                                        "Capture byte limit reached.",
+                                        "Start a shorter capture; limit-ended data is not published.",
+                                        False,
+                                    )
                                     break
                         output.flush()
                         os.fsync(output.fileno())
                     clean = session.error is None and session._stop_flag.is_set()
                 except Exception as exc:
-                    session.error = session.error or _safe_error(exc)
+                    if isinstance(exc, usb.core.USBError):
+                        startup = not session._ready.is_set()
+                        _set_session_error(
+                            session,
+                            "usb_claim_failed" if startup else "usb_io_failed",
+                            (
+                                "The analyzer USB interface could not be claimed."
+                                if startup
+                                else "Analyzer USB I/O failed during capture."
+                            ),
+                            "Close Packetry, reconnect Cynthion CONTROL, and run capture_preflight.",
+                        )
+                    else:
+                        _set_session_error(
+                            session,
+                            "capture_failed",
+                            "Capture failed.",
+                            "Run capture_preflight, then retry.",
+                        )
                     session._ready.set()
                 finally:
                     cleaned = _cleanup_device(session)
                     if cleaned:
                         try:
                             _finalize_file(session, clean)
-                        except Exception as exc:
-                            session.error = session.error or _safe_error(exc)
+                        except Exception:
+                            _set_session_error(
+                                session,
+                                "artifact_publish_failed",
+                                "Capture artifact could not be published.",
+                                "Check capture storage, then retry.",
+                            )
                         session.cleanup_confirmed = True
                         session.finished_at = time.time()
                         _last_session = session
@@ -397,8 +545,13 @@ def start_capture(speed: Literal["auto", "high", "full", "low"] = "auto") -> Cap
                     else:
                         try:
                             _finalize_file(session, False)
-                        except Exception as exc:
-                            session.error = session.error or _safe_error(exc)
+                        except Exception:
+                            _set_session_error(
+                                session,
+                                "cleanup_failed",
+                                "Capture cleanup failed.",
+                                "Retry capture_stop before starting another capture.",
+                            )
                         session.finished_at = time.time()
                         _last_session = session
 
@@ -419,8 +572,13 @@ def start_capture(speed: Literal["auto", "high", "full", "low"] = "auto") -> Cap
                     usb.util.dispose_resources(session._dev)
                     session._dev = None
                     disposed = True
-                except Exception as exc:
-                    session.error = session.error or _safe_error(exc)
+                except Exception:
+                    _set_session_error(
+                        session,
+                        "cleanup_failed",
+                        "Capture cleanup failed.",
+                        "Retry capture_stop; do not start another capture.",
+                    )
                     session.finished_at = time.time()
                     _last_session = session
             if disposed:
@@ -429,32 +587,68 @@ def start_capture(speed: Literal["auto", "high", "full", "low"] = "auto") -> Cap
             raise
     session._ready.wait(STARTUP_TIMEOUT_SECONDS)
     if not session._ready.is_set() or session.error or not session._thread.is_alive():
-        session.error = session.error or "capture startup failed"
+        _set_session_error(
+            session,
+            "capture_start_failed",
+            "Capture startup failed.",
+            "Run capture_preflight, resolve its reported condition, then retry.",
+        )
         session._stop_flag.set()
         session._thread.join(STOP_TIMEOUT_SECONDS)
-        raise RuntimeError("capture startup failed")
+        raise CaptureError(
+            session.error_code or "capture_start_failed",
+            session.error or "Capture startup failed.",
+            session.next_action or "Run capture_preflight, then retry.",
+            session.recoverable is not False,
+        )
     return session
 
 
 def stop_capture() -> CaptureSession:
     with _lock:
         if _active is None:
-            raise RuntimeError("no active capture")
+            raise CaptureError(
+                "no_active_capture",
+                "No capture is active.",
+                "Run capture_start before stopping a capture.",
+            )
         session = _active
         session._stop_flag.set()
     with session._cleanup_lock:
         if session._thread is not None:
             session._thread.join(STOP_TIMEOUT_SECONDS)
             if session._thread.is_alive():
-                raise RuntimeError("capture termination timed out")
+                raise CaptureError(
+                    "capture_stop_timeout",
+                    "Capture did not stop before the timeout.",
+                    "Retry capture_stop; do not start another capture.",
+                )
         if not session.cleanup_confirmed:
             if not _cleanup_device(session):
-                raise RuntimeError("capture cleanup incomplete; retry stop")
+                raise CaptureError(
+                    "cleanup_failed",
+                    "Capture cleanup is incomplete.",
+                    "Retry capture_stop; do not start another capture.",
+                )
             session.cleanup_confirmed = True
-            _finalize_file(session, False)
-            _release_session_ownership(session)
+            try:
+                _finalize_file(session, False)
+            except Exception:
+                _set_session_error(
+                    session,
+                    "artifact_publish_failed",
+                    "Capture artifact could not be finalized.",
+                    "Check capture storage, then run capture_preflight.",
+                )
+            finally:
+                _release_session_ownership(session)
         if session.error:
-            raise RuntimeError("capture stopped with an error")
+            raise CaptureError(
+                session.error_code or "capture_failed",
+                session.error,
+                session.next_action or "Run capture_preflight, then retry.",
+                session.recoverable is not False,
+            )
         return session
 
 
@@ -491,13 +685,62 @@ def read_capture_bytes(capture_id: str, offset: int = 0, length: int = 4096) -> 
 
 
 def _status(session: CaptureSession) -> dict:
-    return {"id": session.id, "speed": session.speed, "started_at": session.started_at,
-            "bytes_written": session.bytes_written, "finished_at": session.finished_at,
-            "terminal": session.finished_at is not None, "cleanup_confirmed": session.cleanup_confirmed,
-            "error": session.error}
+    return {
+        "id": session.id,
+        "speed": session.speed,
+        "started_at": session.started_at,
+        "bytes_written": session.bytes_written,
+        "finished_at": session.finished_at,
+        "terminal": session.finished_at is not None,
+        "cleanup_confirmed": session.cleanup_confirmed,
+        "error": session.error,
+        "error_code": session.error_code,
+        "next_action": session.next_action,
+        "recoverable": session.recoverable,
+    }
 
 
 def session_status() -> dict:
     with _lock:
         session = _active or _last_session
         return _status(session) if session is not None else {"terminal": True, "error": None}
+
+
+def wait_for_capture(min_bytes: int = 1, timeout_seconds: float = 30.0) -> dict:
+    if (
+        isinstance(min_bytes, bool)
+        or not isinstance(min_bytes, int)
+        or not 1 <= min_bytes <= MAX_CAPTURE_BYTES
+        or isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not 0 <= timeout_seconds <= MAX_WAIT_SECONDS
+    ):
+        raise ValueError("invalid capture wait bounds")
+    with _lock:
+        session = _active
+    if session is None:
+        raise CaptureError(
+            "no_active_capture",
+            "No capture is active.",
+            "Run capture_start before waiting for traffic.",
+        )
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        status = _status(session)
+        status["traffic_seen"] = session.bytes_written >= min_bytes
+        if status["traffic_seen"] or status["terminal"] or time.monotonic() >= deadline:
+            return status
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def capture_file_sha256(capture_id: str, suffix: str) -> str:
+    if suffix not in {".bin", ".pcap"}:
+        raise ValueError("invalid capture suffix")
+    fd, _ = open_capture_fd(capture_id, suffix)
+    try:
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, 64 * 1024):
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
