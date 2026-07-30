@@ -215,7 +215,8 @@ def open_capture_fd(capture_id: str, suffix: str = ".bin") -> tuple[int, os.stat
 
 
 def _stored_usage(directory_fd: int) -> tuple[int, int]:
-    count = total = 0
+    records: set[str] = set()
+    total = 0
     for entry in os.scandir(directory_fd):
         try:
             info = entry.stat(follow_symlinks=False)
@@ -223,9 +224,14 @@ def _stored_usage(directory_fd: int) -> tuple[int, int]:
             continue
         if entry.name == STORAGE_LOCK_NAME or not stat.S_ISREG(info.st_mode):
             continue
-        count += 1
+        record = entry.name
+        for suffix in (".pcap.json", ".partial", ".bin", ".pcap"):
+            if entry.name.endswith(suffix) and CAPTURE_ID_RE.fullmatch(entry.name.removesuffix(suffix)):
+                record = entry.name.removesuffix(suffix)
+                break
+        records.add(record)
         total += MAX_CAPTURE_BYTES if entry.name.endswith(".partial") else info.st_size
-    return count, total
+    return len(records), total
 
 
 @contextmanager
@@ -260,7 +266,6 @@ def require_storage_capacity(additional_entries: int, additional_bytes: int, rep
                 info = _entry_regular(directory_fd, name)
             except OSError:
                 continue
-            count -= 1
             total -= info.st_size
         if count + additional_entries > MAX_STORED_CAPTURES or total + additional_bytes > MAX_STORED_BYTES:
             raise CaptureError(

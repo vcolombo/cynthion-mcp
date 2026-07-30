@@ -429,6 +429,32 @@ def test_conversion_reprocesses_and_removes_legacy_metadata(modules, monkeypatch
     assert not legacy.exists()
 
 
+def test_conversion_at_capture_record_limit_does_not_consume_extra_entry(modules, monkeypatch):
+    capture, decoder, tshark, _ = modules
+    capture._ensure_capture_dir()
+    capture_ids = [f"20260728-123456-{index:06x}" for index in range(capture.MAX_STORED_CAPTURES)]
+    for capture_id in capture_ids:
+        (capture.CAPTURES_DIR / f"{capture_id}.bin").write_bytes(b"\xff\x04\x00\x00")
+
+    def convert(fd, dst, *, source_stat=None):
+        Path(dst).write_bytes(b"pcap")
+        return decoder.ConversionResult(Path(dst), 0, 1, 4, {}, "high", 0)
+
+    monkeypatch.setattr(tshark, "cynthion_bin_to_pcap", convert)
+    tshark.ensure_pcap(capture_ids[0])
+
+    directory_fd = capture._dirfd()
+    try:
+        count, _ = capture._stored_usage(directory_fd)
+    finally:
+        os.close(directory_fd)
+    assert count == capture.MAX_STORED_CAPTURES
+    with pytest.raises(capture.CaptureError) as quota:
+        capture._reserve_partial()
+    assert quota.value.code == "storage_quota"
+    assert (capture.CAPTURES_DIR / f"{capture_ids[0]}.pcap").read_bytes() == b"pcap"
+
+
 def test_tshark_requires_verified_executable_hash(modules, monkeypatch, tmp_path):
     _, _, tshark, _ = modules
     executable = tmp_path / "tshark"
