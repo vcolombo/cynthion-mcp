@@ -243,7 +243,7 @@ def _stored_usage(directory_fd: int) -> tuple[int, int]:
         if entry.name == STORAGE_LOCK_NAME or not stat.S_ISREG(info.st_mode):
             continue
         records.add(_capture_record(entry.name))
-        total += MAX_CAPTURE_BYTES if entry.name.endswith(".partial") else info.st_size
+        total += max(MAX_CAPTURE_BYTES, info.st_size) if entry.name.endswith(".partial") else info.st_size
     return len(records), total
 
 

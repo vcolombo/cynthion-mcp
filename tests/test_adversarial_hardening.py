@@ -463,6 +463,21 @@ def test_conversion_at_capture_record_limit_does_not_consume_extra_entry(modules
     assert (capture.CAPTURES_DIR / f"{target}.pcap").read_bytes() == b"pcap"
 
 
+def test_converter_orphan_partial_uses_actual_byte_size(modules, monkeypatch):
+    capture, _, _, _ = modules
+    capture._ensure_capture_dir()
+    capture_id = _valid_capture_id()
+    orphan = capture.CAPTURES_DIR / f".{capture_id}.pcap.123.{'a' * 32}.partial"
+    with orphan.open("wb") as output:
+        output.truncate(capture.MAX_CAPTURE_BYTES + 1)
+    monkeypatch.setattr(capture, "MAX_STORED_BYTES", capture.MAX_CAPTURE_BYTES)
+
+    with pytest.raises(capture.CaptureError) as quota:
+        capture.require_storage_capacity(0, 0)
+
+    assert quota.value.code == "storage_quota"
+
+
 def test_tshark_requires_verified_executable_hash(modules, monkeypatch, tmp_path):
     _, _, tshark, _ = modules
     executable = tmp_path / "tshark"
