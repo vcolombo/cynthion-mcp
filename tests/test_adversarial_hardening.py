@@ -178,6 +178,28 @@ def test_initialization_cleanup_failure_preserves_retryable_ownership(modules, m
     capture.HARDWARE_COORDINATOR.release("after-cleanup")
 
 
+def test_finalize_failure_releases_hardware_ownership(modules, monkeypatch):
+    capture, _, _, _ = modules
+    session = capture.CaptureSession(
+        _valid_capture_id(), "auto", 10.0, Path("x"), "x.partial", 1, 1, 20.0
+    )
+    capture.HARDWARE_COORDINATOR.claim("capture")
+    capture._active = session
+    monkeypatch.setattr(
+        capture,
+        "_finalize_file",
+        lambda *_args: (_ for _ in ()).throw(OSError("storage changed")),
+    )
+
+    with pytest.raises(capture.CaptureError) as error:
+        capture.stop_capture()
+
+    assert error.value.code == "artifact_publish_failed"
+    assert capture._active is None
+    capture.HARDWARE_COORDINATOR.claim("after-finalize-failure")
+    capture.HARDWARE_COORDINATOR.release("after-finalize-failure")
+
+
 def test_capture_uses_monotonic_limit_and_terminal_status(modules, monkeypatch):
     capture, _, _, _ = modules
     session = capture.CaptureSession(

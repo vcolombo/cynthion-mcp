@@ -613,8 +613,17 @@ def stop_capture() -> CaptureSession:
                     "Retry capture_stop; do not start another capture.",
                 )
             session.cleanup_confirmed = True
-            _finalize_file(session, False)
-            _release_session_ownership(session)
+            try:
+                _finalize_file(session, False)
+            except Exception:
+                _set_session_error(
+                    session,
+                    "artifact_publish_failed",
+                    "Capture artifact could not be finalized.",
+                    "Check capture storage, then run capture_preflight.",
+                )
+            finally:
+                _release_session_ownership(session)
         if session.error:
             raise CaptureError(
                 session.error_code or "capture_failed",
