@@ -1,0 +1,12 @@
+name: Semgrep CE
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    uses: vcolombo/github-workflows/.github/workflows/semgrep.yml@cfdd3d764fa695e9dc03d4e556b1cdb89720bdcf
